@@ -20,6 +20,7 @@ import (
 type Event struct {
 	Pid        uint32
 	Ppid       uint32
+	StorageWritten uint32
 	Comm       [16]byte
 	ParentComm [16]byte
 	Filename   [128]byte
@@ -65,8 +66,8 @@ func main() {
 	defer rd.Close()
 
 	fmt.Println("Listening... Ctrl+C to stop")
-	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s\n",
-		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID")
+	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s %-8s\n",
+		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID", "STORED")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -93,13 +94,14 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s\n",
+		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s %-8d\n",
 			event.Pid,
 			event.Ppid,
 			nullTerminated(event.Comm[:]),
 			nullTerminated(event.ParentComm[:]),
 			nullTerminated(event.Filename[:]),
 			nullTerminated(event.RequestID[:]),
+			event.StorageWritten,
 		)
 	}
 }
