@@ -29,6 +29,25 @@ This iteration does not set `K8S_REQUEST_ID`. It only assumes something upstream
 API server's audit / request UID into the exec'd process's environment. Given
 that assumption, the kernel can now name who asked for the command.
 
+## Iteration 2
+
+Write the request ID into task-local storage and read it back. Just enough to
+confirm the round-trip works.
+
+- Add a `BPF_MAP_TYPE_TASK_STORAGE` map (`task_storage_map`) keyed by the
+  `task_struct` and holding `struct request_data { char request_id[64]; }`.
+  The map is declared `BPF_F_NO_PREALLOC` because task storage is created on
+  demand, one slot per task that actually needs it.
+- After finding `K8S_REQUEST_ID=<value>` in the env scan, call
+  `bpf_task_storage_get(..., BPF_LOCAL_STORAGE_GET_F_CREATE)` to allocate or
+  fetch the slot for the current task, and copy the value in with
+  `bpf_probe_read_kernel_str`.
+- The emitted event gains a `storage_written` flag and now reads `request_id`
+  back from task storage instead of directly from the scratch buffer. The
+  reader surfaces this as a new `STORED` column. The round-trip is deliberately
+  redundant — it is the cheapest possible proof that writing to and reading
+  from task storage actually works end-to-end.
+
 ## Layout
 
 - `src/command-logger.bpf.c` — the eBPF program.
@@ -59,11 +78,15 @@ kubectl exec -it some-pod -- env K8S_REQUEST_ID=demo-001 /bin/sh
 Any command you run inside that shell shows up in the reader's output with
 `demo-001` in the `REQUEST_ID` column.
 
-## What this iteration is not
+## What still doesn't work
 
-- It does not persist anything. Output is stdout only.
-- It trusts the variable at face value. Any process that chooses to export
-  `K8S_REQUEST_ID` will be recorded as if it were legitimate.
-- The 512-byte env scan is a hard blind spot. Anything past that is missed.
+- No persistence beyond the reader's stdout. Nothing is written anywhere
+  durable yet.
+- The variable is still trusted at face value. Any process that chooses to
+  export `K8S_REQUEST_ID` will be recorded as if it were legitimate.
+- The 512-byte env scan is still a hard blind spot. Anything past that is
+  missed.
+- Task storage is per-task. A shell's children do not yet see the parent's
+  request ID — inheritance across `fork()` is the next problem.
 
 Each of these is on the list. Later iterations earn the right to solve them.

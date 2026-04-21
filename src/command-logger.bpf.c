@@ -27,15 +27,31 @@ struct
     __type(value, struct env_buf);
 } env_scratch SEC(".maps");
 
+
+struct request_data {
+    char request_id[REQUEST_ID_MAX];
+};
+// Task storage is a custom bpf map whose lifecycle is tracked 
+// alongside that of the corresponding process itself.
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct request_data);
+} task_storage_map SEC(".maps");
+
+
 // format of the event that would be emitted to the ring buffer.
 struct event
 {
     u32 pid;
     u32 ppid;
+    u32 storage_written;
     char comm[16];
     char parent_comm[16];
     char filename[128];
     char request_id[REQUEST_ID_MAX];
+
 };
 
 // definition of ring buffer.
@@ -56,6 +72,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     u32 pid, ppid;
     u32 zero = 0;
     u32 env_size;
+    u32 storage_written = 0;
     int found_off = -1;
 
     // load the env buffer scratch map into the programs memory.
@@ -123,6 +140,16 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
     if (found_off < 0 || found_off >= MAX_ENV_SIZE)
         return 0;
+    // Create a task storage if it does not exist and get a pointer to the data location
+    struct request_data *rd = bpf_task_storage_get(
+                &task_storage_map, task, NULL,
+                BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (!rd) 
+        return 0;
+    // Copy the string from scratch buffer into the task storage
+    bpf_probe_read_kernel_str(rd->request_id,
+                           sizeof(rd->request_id), scratch->buf + found_off);
+    storage_written = 1;
 
     // Reserve ringbuffer memory to write into it directly
     e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -134,6 +161,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
     e->pid = pid;
     e->ppid = ppid;
+    e->storage_written = storage_written;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     BPF_CORE_READ_STR_INTO(&e->parent_comm, task, real_parent, comm);
 
@@ -141,18 +169,11 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     bpf_probe_read_str(&e->filename, sizeof(e->filename),
                        (void *)ctx + fname_off);
 
-    // Write the request ID into the ring buffer event
-    if (found_off + REQUEST_ID_MAX <= MAX_ENV_SIZE)
-    {
-        #pragma unroll
-        for (int j = 0; j < REQUEST_ID_MAX; j++)
-        {
-            char c = scratch->buf[(found_off + j) & (MAX_ENV_SIZE - 1)];
-            if (c == '\0')
-                break;
-            e->request_id[j & (REQUEST_ID_MAX - 1)] = c;
-        }
-    }
+    // Read the request ID from the task storage. 
+    // Though this may feel unnecessary, the goal here is to verify 
+    // if we can write to and read from the task storage.
+    bpf_probe_read_kernel_str(e->request_id,
+                            sizeof(e->request_id), rd->request_id);
 
     // Emit the event
     bpf_ringbuf_submit(e, 0);
