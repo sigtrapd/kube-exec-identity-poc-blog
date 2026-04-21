@@ -26,6 +26,7 @@ type Event struct {
 	ParentComm       [16]byte
 	Filename         [128]byte
 	RequestID        [64]byte
+	Args             [256]byte
 }
 
 func main() {
@@ -71,8 +72,8 @@ func main() {
 	defer rd.Close()
 
 	fmt.Println("Listening... Ctrl+C to stop")
-	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s %-8s %-6s\n",
-		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID", "STORED", "PARENT_SRC")
+	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s %-8s %-10s %s\n",
+		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID", "STORED", "PARENT_SRC", "ARGS")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -99,7 +100,7 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s %-8d %-6d\n",
+		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s %-8d %-10d %s\n",
 			event.Pid,
 			event.Ppid,
 			nullTerminated(event.Comm[:]),
@@ -108,6 +109,7 @@ func main() {
 			nullTerminated(event.RequestID[:]),
 			event.StorageWritten,
 			event.FromParent,
+			argString(event.Args[:]),
 		)
 	}
 }
@@ -118,4 +120,28 @@ func nullTerminated(b []byte) string {
 		return string(b)
 	}
 	return string(b[:n])
+}
+
+// argString parses the raw argv buffer shipped from BPF.
+// The buffer is NUL-separated starting with argv[0] (which duplicates
+// `filename`). We drop argv[0] and join the rest with spaces.
+func argString(b []byte) string {
+	end := len(b)
+	for end > 0 && b[end-1] == 0 {
+		end--
+	}
+	if end == 0 {
+		return ""
+	}
+	parts := bytes.Split(b[:end], []byte{0})
+	out := make([][]byte, 0, len(parts))
+	for _, p := range parts {
+		if len(p) > 0 {
+			out = append(out, p)
+		}
+	}
+	if len(out) <= 1 {
+		return ""
+	}
+	return string(bytes.Join(out[1:], []byte{' '}))
 }
