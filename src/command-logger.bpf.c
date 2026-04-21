@@ -13,6 +13,10 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 // The maximum possible size of a request ID.
 #define REQUEST_ID_MAX 64
 
+// Max bytes of argv[] (excluding argv[0]) captured per event.
+// Must be a power of two so the verifier accepts `& (MAX_ARGS_SIZE - 1)`.
+#define MAX_ARGS_SIZE 256
+
 struct env_buf
 {
     char buf[MAX_ENV_SIZE];
@@ -52,6 +56,7 @@ struct event
     char parent_comm[16];
     char filename[128];
     char request_id[REQUEST_ID_MAX];
+    char args[MAX_ARGS_SIZE];
 
 };
 
@@ -204,7 +209,25 @@ emit:
     bpf_probe_read_kernel_str(e->request_id,
                             sizeof(e->request_id), rd->request_id);
 
-    // Emit the event
+    // Ship the raw argv region (NUL-separated, starts with argv[0]) as a
+    // single buffer. User space is responsible for splitting and trimming.
+    __builtin_memset(e->args, 0, sizeof(e->args));
+    mm = task->mm;
+    if (mm) {
+        unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
+        unsigned long arg_end   = BPF_CORE_READ(mm, arg_end);
+
+        if (arg_start && arg_end && arg_end > arg_start) {
+            long arg_size = arg_end - arg_start;
+            if (arg_size > MAX_ARGS_SIZE)
+                arg_size = MAX_ARGS_SIZE;
+
+            bpf_probe_read_user(e->args,
+                                arg_size & (MAX_ARGS_SIZE - 1),
+                                (void *)arg_start);
+        }
+    }
+
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

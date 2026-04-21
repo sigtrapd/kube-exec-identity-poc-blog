@@ -80,6 +80,27 @@ compare was rewritten as a rolling state machine that advances one character
 at a time and resyncs fast on `K`. Same result, four times the reach, no
 verifier fight.
 
+## Iteration 4
+
+Capture `argv` too. Knowing that `cat` ran is half the story; the interesting
+half is that it ran on `/etc/shadow`.
+
+- The event grows an `args[256]` field. The BPF program reads `mm->arg_start`
+  and `mm->arg_end` — the kernel's record of the exec'd process's argv region
+  — and copies up to 256 bytes into the event as a single NUL-separated blob.
+- `MAX_ARGS_SIZE` is 256, deliberately a power of two, so the size passed to
+  `bpf_probe_read_user` can be masked with `& (MAX_ARGS_SIZE - 1)`. The
+  verifier needs a statically bounded length; masking against a power-of-two
+  constant is how you give it one without losing the dynamic size.
+- User space does the parsing: split the buffer on NUL, drop `argv[0]` (it
+  duplicates `filename`), join the rest with spaces. The reader renders it in
+  a new `ARGS` column.
+
+Same hook, same event, one more field. Nothing in the tamper model changes —
+argv lives in the same `mm_struct` the env block came from, captured at the
+same execve moment, before the new process has run a single userspace
+instruction.
+
 ## Layout
 
 - `src/command-logger.bpf.c` — the eBPF program.
