@@ -47,6 +47,7 @@ struct event
     u32 pid;
     u32 ppid;
     u32 storage_written;
+    u32 from_parent;
     char comm[16];
     char parent_comm[16];
     char filename[128];
@@ -65,15 +66,20 @@ SEC("tp/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
     struct task_struct *task;
+    struct task_struct *parent;
     struct mm_struct *mm;
     struct event *e;
     struct env_buf *scratch;
+    struct request_data *rd = NULL;
+    struct request_data *prd;
     unsigned long env_start, env_end;
     u32 pid, ppid;
     u32 zero = 0;
     u32 env_size;
     u32 storage_written = 0;
+    u32 from_parent = 0;
     int found_off = -1;
+    char parent_id0;
 
     // load the env buffer scratch map into the programs memory.
     // use the pointer to traverse through the env buffer.
@@ -86,7 +92,33 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     if (!task)
         return 0;
 
-    // fetch the memory address space
+    /* Direct field access keeps the pointer "trusted" for the verifier;
+     * BPF_CORE_READ would turn it into a scalar and bpf_task_storage_get
+     * rejects that. */
+    parent = task->real_parent;
+    if (parent) {
+        prd = bpf_task_storage_get(&task_storage_map, parent, NULL, 0);
+        if (prd &&
+            bpf_probe_read_kernel(&parent_id0, 1, prd->request_id) == 0 &&
+            parent_id0) {
+            rd = bpf_task_storage_get(&task_storage_map, task, NULL,
+                          BPF_LOCAL_STORAGE_GET_F_CREATE);
+            if (rd) {
+                bpf_probe_read_kernel_str(rd->request_id,
+                              sizeof(rd->request_id),
+                              prd->request_id);
+                storage_written = 1;
+                from_parent = 1;
+                /* Parent already carries the identity: skip the env scan. */
+                goto emit;
+            }
+        }
+    }
+
+    scratch = bpf_map_lookup_elem(&env_scratch, &zero);
+    if (!scratch)
+        goto emit;
+
     mm = BPF_CORE_READ(task, mm);
     // BPF_CORE_READ is used because the BPF verifier does not allow direct
     // pointer dereference of kernel pointers. It also handles struct field
@@ -96,8 +128,6 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
     env_start = BPF_CORE_READ(mm, env_start);
     env_end = BPF_CORE_READ(mm, env_end);
-
-
 
     if (!env_start || !env_end || env_end <= env_start)
         return 0;
@@ -133,20 +163,23 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
         }
     }
 
-    if (found_off < 0 || found_off >= MAX_ENV_SIZE)
-        return 0;
-    // Create a task storage if it does not exist and get a pointer to the data location
-    struct request_data *rd = bpf_task_storage_get(
-                &task_storage_map, task, NULL,
-                BPF_LOCAL_STORAGE_GET_F_CREATE);
-    if (!rd) 
-        return 0;
-    // Copy the string from scratch buffer into the task storage
-    bpf_probe_read_kernel_str(rd->request_id,
-                           sizeof(rd->request_id), scratch->buf + found_off);
-    storage_written = 1;
+    if (found_off >= 0 && found_off < MAX_ENV_SIZE) {
+        if (!rd)
+            rd = bpf_task_storage_get(&task_storage_map, task, NULL,
+                          BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (rd) {
+            bpf_probe_read_kernel_str(rd->request_id,
+                           sizeof(rd->request_id),
+                           scratch->buf + found_off);
+            storage_written = 1;
+            from_parent = 0;
+        }
+    }
 
-    // Reserve ringbuffer memory to write into it directly
+emit:
+    if (!storage_written || !rd)
+        return 0;
+
     e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     if (!e)
         return 0;
@@ -157,6 +190,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     e->pid = pid;
     e->ppid = ppid;
     e->storage_written = storage_written;
+    e->from_parent = from_parent;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     BPF_CORE_READ_STR_INTO(&e->parent_comm, task, real_parent, comm);
 
