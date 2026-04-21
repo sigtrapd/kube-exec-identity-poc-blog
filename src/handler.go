@@ -38,9 +38,13 @@ func main() {
 		log.Fatalf("failed to load BPF spec: %v", err)
 	}
 
-	// Load and verify the BPF program. The verifier checks for correctness,
-	// bounded loops, valid memory access, and allowed helper calls.
-	coll, err := ebpf.NewCollection(spec)
+	opts := ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogLevel:     ebpf.LogLevelBranch,
+			LogSizeStart: 10 * 1024 * 1024,
+		},
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

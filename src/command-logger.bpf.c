@@ -6,9 +6,9 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-// The maximum size of environment buffer the program can scan. 
-// Anything that exceeds this is a blind spot.
-#define MAX_ENV_SIZE 512
+// Max bytes copied from the process env block into scratch for scanning.
+// Linux environ can be much larger (ARG_MAX); this is our deliberate cap.
+#define MAX_ENV_SIZE 2048
 
 // The maximum possible size of a request ID.
 #define REQUEST_ID_MAX 64
@@ -113,28 +113,23 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     if (ret < 0)
         return 0;
 
-    // Search for the environment variable K8S_REQUEST_ID
-    #pragma unroll
-    for (int i = 0; i < MAX_ENV_SIZE - 15; i++)
     {
-        if (scratch->buf[i] == 'K' &&
-            scratch->buf[i + 1] == '8' &&
-            scratch->buf[i + 2] == 'S' &&
-            scratch->buf[i + 3] == '_' &&
-            scratch->buf[i + 4] == 'R' &&
-            scratch->buf[i + 5] == 'E' &&
-            scratch->buf[i + 6] == 'Q' &&
-            scratch->buf[i + 7] == 'U' &&
-            scratch->buf[i + 8] == 'E' &&
-            scratch->buf[i + 9] == 'S' &&
-            scratch->buf[i + 10] == 'T' &&
-            scratch->buf[i + 11] == '_' &&
-            scratch->buf[i + 12] == 'I' &&
-            scratch->buf[i + 13] == 'D' &&
-            scratch->buf[i + 14] == '=')
-        {
-            found_off = i + 15;
-            break;
+        const char needle[] = "K8S_REQUEST_ID=";
+        u32 state = 0;
+
+#pragma clang loop unroll(disable)
+        for (int i = 0; i < MAX_ENV_SIZE - 15; i++) {
+            unsigned char c = scratch->buf[i];
+
+            if (c == (unsigned char)needle[state]) {
+                state++;
+                if (state == 15) {
+                    found_off = i + 1;
+                    break;
+                }
+            } else {
+                state = (c == 'K') ? 1 : 0;
+            }
         }
     }
 
