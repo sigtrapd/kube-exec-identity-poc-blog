@@ -101,6 +101,44 @@ argv lives in the same `mm_struct` the env block came from, captured at the
 same execve moment, before the new process has run a single userspace
 instruction.
 
+## Iteration 5
+
+Move env-var reading off the exec tracepoint and onto the syscall entry. Stop
+staring at a fixed-size slab; walk `envp[]` one entry at a time.
+
+The previous approach copied up to 2048 bytes of the flattened env block out
+of `mm->env_start..env_end` and scanned it for `K8S_REQUEST_ID=`. That is
+fine until a single preceding env var is enormous — a maximal `PATH`, an
+`LD_LIBRARY_PATH` padded out by a container image, a serialised config blob
+some init system stuffs into the environment. Anything like that pushes the
+interesting variable past the window and the scan silently misses.
+
+- A second hook gets attached on
+  `tracepoint/syscalls/sys_enter_execve`. Its only job is to find
+  `K8S_REQUEST_ID` and stash it into the current task's storage, before the
+  exec commits.
+- At `sys_enter`, `ctx->args[2]` is the userspace `char **envp` pointer. The
+  BPF program reads it one pointer at a time with `bpf_probe_read_user`,
+  pulls each env string onto a small on-stack buffer (`REQUEST_ID_MAX + 16`,
+  well under the 512-byte BPF stack limit), and prefix-matches there.
+- The `mm->env_start..env_end` slab scan is gone. So is the per-CPU scratch
+  map, so is the 2048-byte cap, so is the rolling state machine.
+- The bound becomes a count, not a size. `MAX_ENV_VARS` is 64 — the walk
+  stops after 64 env entries. A giant preceding `PATH=...` no longer pushes
+  the request ID out of reach; the size of what comes before it stops
+  mattering at all.
+
+The `sched_process_exec` hook becomes a pure emitter. Its logic collapses to:
+prefer the parent's task storage, fall back to the current task's storage,
+and if neither carries a `request_id`, stay silent.
+
+One question that always comes up — failed `execve`s. `sys_enter_execve`
+fires on the attempt, not the success. If the exec later returns `ENOENT`,
+the stash in task storage is orphaned for a moment. It is harmless: nothing
+emits until `sched_process_exec`, which only fires on success, and the next
+successful `execve` in that task will either overwrite the slot from its own
+envp or inherit from the parent on exec.
+
 ## Layout
 
 - `src/command-logger.bpf.c` — the eBPF program.
@@ -135,8 +173,8 @@ Any command you run inside that shell shows up in the reader's output with
 
 - No persistence beyond the reader's stdout. Nothing is written anywhere
   durable yet.
-- The 2048-byte env scan is still a bounded window. Environments larger than
-  that at the session root are a blind spot.
+- The `envp[]` walk stops at 64 entries. A root exec with `K8S_REQUEST_ID`
+  past position 64 would still be missed — unlikely in practice, real.
 - Env at the root is still the one point of trust. The whole chain holds
   only if the mutating webhook is what put `K8S_REQUEST_ID` there; anything
   else that injects the variable on a root-level exec gets believed once, and

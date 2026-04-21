@@ -56,13 +56,21 @@ func main() {
 	}
 	defer coll.Close()
 
-	// Attach the hook section to the corresponding tracepoint
-	tp, err := link.Tracepoint("sched", "sched_process_exec",
+	// Hook 1: capture K8S_REQUEST_ID from envp before execve commits.
+	tpEnter, err := link.Tracepoint("syscalls", "sys_enter_execve",
+		coll.Programs["handle_execve_enter"], nil)
+	if err != nil {
+		log.Fatalf("failed to attach sys_enter_execve: %v", err)
+	}
+	defer tpEnter.Close()
+
+	// Hook 2: emit event on successful exec (with parent inheritance fallback).
+	tpExec, err := link.Tracepoint("sched", "sched_process_exec",
 		coll.Programs["handle_exec"], nil)
 	if err != nil {
-		log.Fatalf("failed to attach tracepoint: %v", err)
+		log.Fatalf("failed to attach sched_process_exec: %v", err)
 	}
-	defer tp.Close()
+	defer tpExec.Close()
 
 	// Setup the rinbuffer reader from the map defined in the bpf code.
 	rd, err := ringbuf.NewReader(coll.Maps["rb"])
