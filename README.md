@@ -48,6 +48,38 @@ confirm the round-trip works.
   redundant — it is the cheapest possible proof that writing to and reading
   from task storage actually works end-to-end.
 
+## Iteration 3
+
+Make the parent's task storage the source of truth. Env is consulted only at
+the root of a session — for everything downstream, the kernel's own record of
+the ancestor wins.
+
+- On every `sched_process_exec`, look up `task->real_parent` in
+  `task_storage_map`. If the parent carries a non-empty `request_id`, copy it
+  straight into the child's slot and skip the env scan entirely.
+- The env scan only runs when the parent has nothing. In practice that is the
+  session root — the first process the mutating webhook injected
+  `K8S_REQUEST_ID` into.
+- Once the root is stored, every descendant — shells, pipelines, whatever a
+  user runs — inherits the identity by ancestry. A child that sets
+  `K8S_REQUEST_ID=<anything>` in its own env is ignored, because the lookup
+  against the parent short-circuits before the env block is ever read.
+- The event gains a `from_parent` flag and the reader gains a `PARENT_SRC`
+  column (`1` = inherited from the parent's task storage, `0` = scanned from
+  env at the root).
+
+One implementation detail worth the line: `task->real_parent` is read as a
+direct field access rather than through `BPF_CORE_READ`. `BPF_CORE_READ`
+returns a scalar, and `bpf_task_storage_get` refuses anything that is not a
+"trusted" pointer. The program does not load if you get this wrong.
+
+The env scan also got some room to breathe. `MAX_ENV_SIZE` moves from 512 to
+2048, which covers almost every real-world process environment we saw. To
+keep the verifier happy at the larger bound, the 15-byte unrolled `K8S_...`
+compare was rewritten as a rolling state machine that advances one character
+at a time and resyncs fast on `K`. Same result, four times the reach, no
+verifier fight.
+
 ## Layout
 
 - `src/command-logger.bpf.c` — the eBPF program.
@@ -82,11 +114,11 @@ Any command you run inside that shell shows up in the reader's output with
 
 - No persistence beyond the reader's stdout. Nothing is written anywhere
   durable yet.
-- The variable is still trusted at face value. Any process that chooses to
-  export `K8S_REQUEST_ID` will be recorded as if it were legitimate.
-- The 512-byte env scan is still a hard blind spot. Anything past that is
-  missed.
-- Task storage is per-task. A shell's children do not yet see the parent's
-  request ID — inheritance across `fork()` is the next problem.
+- The 2048-byte env scan is still a bounded window. Environments larger than
+  that at the session root are a blind spot.
+- Env at the root is still the one point of trust. The whole chain holds
+  only if the mutating webhook is what put `K8S_REQUEST_ID` there; anything
+  else that injects the variable on a root-level exec gets believed once, and
+  then inherited by every child.
 
 Each of these is on the list. Later iterations earn the right to solve them.

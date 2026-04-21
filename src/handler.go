@@ -21,6 +21,7 @@ type Event struct {
 	Pid            uint32
 	Ppid           uint32
 	StorageWritten uint32
+	FromParent     uint32
 	Comm           [16]byte
 	ParentComm     [16]byte
 	Filename       [128]byte
@@ -38,9 +39,13 @@ func main() {
 		log.Fatalf("failed to load BPF spec: %v", err)
 	}
 
-	// Load and verify the BPF program. The verifier checks for correctness,
-	// bounded loops, valid memory access, and allowed helper calls.
-	coll, err := ebpf.NewCollection(spec)
+	opts := ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogLevel:     ebpf.LogLevelBranch,
+			LogSizeStart: 10 * 1024 * 1024,
+		},
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -66,8 +71,8 @@ func main() {
 	defer rd.Close()
 
 	fmt.Println("Listening... Ctrl+C to stop")
-	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s %-8s\n",
-		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID", "STORED")
+	fmt.Printf("%-8s %-8s %-16s %-16s %-40s %-36s %-8s %-6s\n",
+		"PID", "PPID", "COMM", "PARENT", "FILENAME", "REQUEST_ID", "STORED", "PARENT_SRC")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -94,7 +99,7 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s %-8d\n",
+		fmt.Printf("%-8d %-8d %-16s %-16s %-40s %-36s %-8d %-6d\n",
 			event.Pid,
 			event.Ppid,
 			nullTerminated(event.Comm[:]),
@@ -102,6 +107,7 @@ func main() {
 			nullTerminated(event.Filename[:]),
 			nullTerminated(event.RequestID[:]),
 			event.StorageWritten,
+			event.FromParent,
 		)
 	}
 }
